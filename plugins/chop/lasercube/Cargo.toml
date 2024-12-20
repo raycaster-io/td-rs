@@ -1,5 +1,5 @@
 [package]
-name = "generator-chop"
+name = "lasercube"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,10 +7,10 @@ edition = "2021"
 type = "chop"
 
 [lib]
-name = "generator_chop"
+name = "lasercube"
 crate-type = ["staticlib"]
 
 [dependencies]
-td-rs-chop = { path = "../../../td-rs-chop", features = ["tracing"] }
+td-rs-chop = { path = "../../../td-rs-chop" }
 td-rs-derive = { path = "../../../td-rs-derive" }
-tracing = "0.1"
+packed_struct = "0.10.1"

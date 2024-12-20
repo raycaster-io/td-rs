@@ -16,6 +16,7 @@ members = [
     "plugins/chop/euro-filter",
     "plugins/chop/filter",
     "plugins/chop/generator",
+    "plugins/chop/lasercube",
     "plugins/chop/monome-grid",
     "plugins/chop/python",
     "plugins/chop/wasm",
