@@ -38,10 +38,15 @@ PROMOTED_PARS = [
 
 # The plugin reacts to Refresh via the SDK's pulsePressed event, which a
 # value binding does not deliver — forward the promoted pulse explicitly.
+# Guarded so a missing plugin binary flags nothing instead of erroring.
 REFRESH_CALLBACK = '''\
 def onPulse(par):
-    if par.name == 'Refreshdevices':
-        op('laser').par.Refresh.pulse()
+    if par.name != 'Refreshdevices':
+        return
+    laser = op('laser')
+    refresh = getattr(laser.par, 'Refresh', None) if laser else None
+    if refresh is not None:
+        refresh.pulse()
     return
 '''
 
@@ -101,12 +106,27 @@ def build():
             # Relative reference so the .tox survives renames/relocation.
             new_pars[0].menuSource = f"op('./laser').par.{members[0].name}"
         for i, member in enumerate(members):
-            member.bindExpr = f"parent().par.{new_pars[i].name}"
+            # Match tuplet members by name suffix (Defaultcolorr -> ...r):
+            # pars() ordering is undocumented, so index alignment alone could
+            # cross-bind color channels.
+            suffix = member.name[len(inner_name):]
+            target = next(
+                (p for p in new_pars if p.name[len(comp_name):] == suffix),
+                new_pars[i] if i < len(new_pars) else None,
+            )
+            if target is not None:
+                member.bindExpr = f"parent().par.{target.name}"
 
     # Forward the promoted Refresh pulse as a real pulse event.
     parexec = comp.create(parameterexecuteDAT, 'refresh_exec')
     parexec.par.op = '..'
     parexec.par.pars = 'Refreshdevices'
+    # Pin the toggles the callback depends on rather than trusting the DAT's
+    # defaults ('On Pulse' and 'Custom' must be on for a custom pulse par).
+    for toggle in ('active', 'custom', 'onpulse'):
+        toggle_par = getattr(parexec.par, toggle, None)
+        if toggle_par is not None:
+            toggle_par.val = True
     parexec.text = REFRESH_CALLBACK
 
     comp.par.opshortcut = TOX_NAME

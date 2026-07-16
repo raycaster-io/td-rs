@@ -8,13 +8,14 @@
 //!
 //! Laser safety: the Active toggle defaults to off, x/y are hard-clamped to
 //! [-1, 1] (non-finite coordinates are blanked), a blank frame is emitted on
-//! input loss, and hardware sessions are disarmed on teardown. Galvo
-//! velocity/density limiting is the DAC's (or laser-dac's) responsibility —
-//! this plugin does not implement scanner-safety profiles.
+//! input loss, and hardware teardown disarms the session and lets the device
+//! queue drain into blanks before stopping. Galvo velocity/density limiting
+//! is the DAC's (or laser-dac's) responsibility — this plugin does not
+//! implement scanner-safety profiles.
 //!
-//! Threading: DAC discovery and connecting both block for seconds (network
-//! scans), so they run on background threads and hand results back over
-//! channels; `execute()` only ever polls.
+//! Threading: DAC discovery, connecting, and teardown all block (network
+//! scans, buffer flushes, thread joins), so they run on background threads
+//! and hand results back over channels; `execute()` only ever polls.
 
 mod device;
 mod mapping;
@@ -90,6 +91,12 @@ enum Connection {
         rx: mpsc::Receiver<ConnectResult>,
         config: ConnConfig,
     },
+    /// An abandoned connect (config changed mid-flight) still owns the
+    /// device until its thread resolves — single-client DACs refuse a second
+    /// connection, so no new connect starts until this drains.
+    Draining {
+        rx: mpsc::Receiver<ConnectResult>,
+    },
     Connected {
         backend: Box<dyn LaserBackend>,
         config: ConnConfig,
@@ -111,6 +118,11 @@ pub struct LaserDeviceChop {
     /// In-flight background device scan, if any.
     scan_rx: Option<mpsc::Receiver<Result<Vec<DeviceEntry>, String>>>,
     scanned_once: bool,
+    /// Retry ticket for a Failed connection. Set by the Refresh pulse and by
+    /// completed device scans; cleared when consumed by a connect attempt or
+    /// once the connection is healthy. Deliberately NOT cleared while a
+    /// connect is in flight, so a pulse/scan that lands mid-Connecting still
+    /// retries if that connect fails.
     force_reconnect: bool,
     points_buf: Vec<Point2>,
     // Per-instance status strings: the framework's default set_info/
@@ -136,6 +148,13 @@ impl LaserDeviceChop {
         }
     }
 
+    /// Retire a backend off the cook thread: shutdown() disarms, waits for
+    /// the device queue to drain into blanks, then stops and joins the
+    /// scheduler — seconds of blocking in the worst (mid-reconnect) case.
+    fn teardown(backend: Box<dyn LaserBackend>) {
+        std::thread::spawn(move || backend.shutdown());
+    }
+
     /// Kick off a background device scan unless one is already running.
     /// Discovery blocks for ~2s of sequential network scans, so it must
     /// never run on the cook thread.
@@ -158,10 +177,12 @@ impl LaserDeviceChop {
         match rx.try_recv() {
             Ok(Ok(devices)) => {
                 self.devices = devices;
-                // A fresh scan may make a previously-unresolvable device
-                // selection connectable (e.g. a saved .toe whose device is
-                // found by the startup scan) — retry a Failed connection.
-                if self.params.active && matches!(self.conn, Connection::Failed { .. }) {
+                // Fresh scan data may make an unresolvable device selection
+                // connectable (a saved .toe found by the startup scan, a DAC
+                // that changed IP). Arm a retry unless already healthy; if a
+                // connect is in flight the ticket survives until it either
+                // succeeds (cleared below) or fails (consumed by the retry).
+                if self.params.active && !matches!(self.conn, Connection::Connected { .. }) {
                     self.force_reconnect = true;
                 }
             }
@@ -224,34 +245,68 @@ impl LaserDeviceChop {
         let want = self.params.active;
         let config = self.conn_config();
 
-        // Consume the Refresh latch up front: a pulse while Connected must
-        // not linger and trigger a surprise reconnect after a later failure.
-        let force = std::mem::take(&mut self.force_reconnect);
+        // The retry ticket exists only to revive a Failed connection; drop
+        // it once the connection is healthy so a Refresh pulsed on a live
+        // session can't trigger a surprise reconnect after a later failure.
+        if matches!(self.conn, Connection::Connected { .. }) {
+            self.force_reconnect = false;
+        }
 
-        // Tear down when deactivated or when the active backend's config
-        // changed. (An abandoned Connecting thread drops its backend when
-        // the channel closes; DacBackend's Drop disarms the session.)
+        if !want {
+            // Deactivation clears state and status ONCE (edge-triggered):
+            // clearing every inactive cook would erase scan warnings the
+            // instant poll_devices() raises them.
+            if !matches!(self.conn, Connection::Idle) {
+                if let Connection::Connected { backend, .. } =
+                    std::mem::replace(&mut self.conn, Connection::Idle)
+                {
+                    Self::teardown(backend);
+                }
+                self.conn = Connection::Idle;
+                self.set_info("");
+                self.set_warning("");
+            }
+            return;
+        }
+
+        // Config changed under a live or in-flight connection: retire it.
         let stale = match &self.conn {
             Connection::Connected { config: c, .. } | Connection::Connecting { config: c, .. } => {
-                !want || *c != config
+                *c != config
             }
             _ => false,
         };
         if stale {
-            if let Connection::Connected { mut backend, .. } =
-                std::mem::replace(&mut self.conn, Connection::Idle)
-            {
-                let _ = backend.blank();
-                // Dropping the backend disarms and stops its session.
+            match std::mem::replace(&mut self.conn, Connection::Idle) {
+                Connection::Connected { backend, .. } => Self::teardown(backend),
+                // The in-flight connect may already own the device; hold in
+                // Draining until it resolves rather than racing a second
+                // connect against it.
+                Connection::Connecting { rx, .. } => self.conn = Connection::Draining { rx },
+                _ => unreachable!(),
             }
             self.set_info("");
         }
 
-        if !want {
-            // A deactivated node must not keep displaying stale status.
-            self.conn = Connection::Idle;
-            self.set_warning("");
-            return;
+        // Wait out an abandoned connect before starting a new one.
+        if matches!(self.conn, Connection::Draining { .. }) {
+            let resolved = match &self.conn {
+                Connection::Draining { rx } => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Ok(res) => Some(res.ok()),
+                    Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                },
+                _ => unreachable!(),
+            };
+            match resolved {
+                None => return, // still draining
+                Some(backend) => {
+                    if let Some(backend) = backend {
+                        Self::teardown(backend);
+                    }
+                    self.conn = Connection::Idle;
+                }
+            }
         }
 
         // Poll an in-flight connect.
@@ -273,6 +328,7 @@ impl LaserDeviceChop {
                     Ok(backend) => {
                         self.set_info(&backend.describe());
                         self.set_warning("");
+                        self.force_reconnect = false;
                         self.conn = Connection::Connected {
                             backend,
                             config,
@@ -292,10 +348,13 @@ impl LaserDeviceChop {
 
         let should_connect = match &self.conn {
             Connection::Idle => true,
-            Connection::Failed { config: c } => force || *c != config,
-            Connection::Connected { .. } | Connection::Connecting { .. } => false,
+            Connection::Failed { config: c } => self.force_reconnect || *c != config,
+            _ => false,
         };
         if should_connect {
+            // Consume the retry ticket only when it actually drives a
+            // connect attempt.
+            self.force_reconnect = false;
             self.spawn_connect(config);
         }
     }
@@ -478,9 +537,11 @@ impl Chop for LaserDeviceChop {
             Some(Err(SendError::Fatal(e))) => {
                 self.set_warning(&e);
                 self.set_info("");
-                if let Connection::Connected { config, .. } =
-                    std::mem::replace(&mut self.conn, Connection::Idle)
+                if let Connection::Connected {
+                    backend, config, ..
+                } = std::mem::replace(&mut self.conn, Connection::Idle)
                 {
+                    Self::teardown(backend);
                     self.conn = Connection::Failed { config };
                 }
             }

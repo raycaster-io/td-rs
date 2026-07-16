@@ -9,8 +9,14 @@ use ponk_protocol::{encode_datagrams, DataFormat, PonkFrame, PonkPath, PonkPoint
 
 use crate::mapping::Point2;
 
-/// Number of blanked points sent as a safety blank before teardown.
+/// Number of blanked points sent as a safety blank frame.
 const BLANK_POINTS: usize = 32;
+
+/// How long a hardware shutdown keeps the disarmed session alive so the
+/// device's queued bright points play out and are followed by software
+/// blanks before the scheduler stops. Sized to comfortably exceed laser-dac's
+/// device buffer targets (tens of milliseconds).
+const SHUTDOWN_FLUSH: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Maximum UDP datagram size for PONK output. Kept under a typical ethernet
 /// MTU so frames survive networks that drop fragmented UDP.
@@ -28,21 +34,16 @@ pub enum SendError {
     Fatal(String),
 }
 
-impl SendError {
-    pub fn message(&self) -> &str {
-        match self {
-            SendError::Warn(m) | SendError::Fatal(m) => m,
-        }
-    }
-}
-
 /// A destination laser points can be streamed to once per cook.
 pub trait LaserBackend: Send {
     /// Submit one frame of points. Must not block the cook thread.
     fn send(&mut self, points: &[Point2]) -> Result<(), SendError>;
     /// Emit an all-black frame (safety blank), used when the input goes away.
-    /// (Teardown safety is the backend's own job on Drop — see `DacBackend`.)
     fn blank(&mut self) -> Result<(), SendError>;
+    /// Deliberate teardown. May block (waiting for the device to go dark,
+    /// joining threads) — run it on a background thread, never the cook
+    /// thread. The default just drops the backend.
+    fn shutdown(self: Box<Self>) {}
     /// Human-readable description of the connected output for the info popup.
     fn describe(&self) -> String;
     /// Whether the underlying output still looks healthy.
@@ -149,6 +150,19 @@ impl LaserBackend for DacBackend {
         self.send(&[Point2::default(); BLANK_POINTS])
     }
 
+    fn shutdown(self: Box<Self>) {
+        // Disarm blanks all FUTURE points of a still-running stream, but the
+        // device's already-queued bright points keep playing, and stop() is
+        // observed by the scheduler ahead of everything else (its stop-path
+        // shutter close is a no-op on Ether Dream/IDN). So: disarm, keep the
+        // session alive long enough for the queue to drain into software
+        // blanks, then stop via Drop. Blocking — callers run this on a
+        // background thread.
+        let _ = self.session.control().disarm();
+        std::thread::sleep(SHUTDOWN_FLUSH);
+        // Drop stops and joins the scheduler thread.
+    }
+
     fn describe(&self) -> String {
         format!("{} ({})", self.name, self.id)
     }
@@ -160,11 +174,10 @@ impl LaserBackend for DacBackend {
 
 impl Drop for DacBackend {
     fn drop(&mut self) {
-        // Disarm BEFORE stopping: stop() is checked by the scheduler ahead of
-        // the frame slot, so a blank frame sent just before teardown is
-        // usually discarded, and the stop path's shutter close is a no-op on
-        // Ether Dream/IDN. Disarming forces intensity/RGB to zero in software
-        // regardless — laser-dac's documented safe-off for exactly this.
+        // Backstop for non-shutdown() drops (e.g. an abandoned connect
+        // thread, where the session was just armed and never showed a
+        // frame). Deliberate teardown goes through shutdown(), which flushes
+        // blanks before this stop lands.
         let _ = self.session.control().disarm();
         let _ = self.session.control().stop();
     }
@@ -281,6 +294,11 @@ impl LaserBackend for PonkBackend {
     fn blank(&mut self) -> Result<(), SendError> {
         // A pathless frame tells receivers to draw nothing.
         self.send(&[])
+    }
+
+    fn shutdown(mut self: Box<Self>) {
+        // Leave receivers dark rather than replaying the last frame.
+        let _ = self.blank();
     }
 
     fn describe(&self) -> String {

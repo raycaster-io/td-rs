@@ -32,8 +32,12 @@ pub fn derive_param(input: TokenStream) -> TokenStream {
 
     let variants = enum_data.variants.into_iter().collect::<Vec<Variant>>();
     let try_from_i32_match_arms = try_from_i32_match_arms(&variants);
-    let first_variant = &variants
-        .first()
+    // Fallback for out-of-range menu indices: the #[default] variant when
+    // one is marked, else the first variant.
+    let fallback_variant = &variants
+        .iter()
+        .find(|v| v.attrs.iter().any(|a| a.path.is_ident("default")))
+        .or_else(|| variants.first())
         .expect("`Param` enums must have at least one variant")
         .ident;
 
@@ -76,8 +80,8 @@ pub fn derive_param(input: TokenStream) -> TokenStream {
                 // Menu indices can arrive out of range (stale saved files,
                 // exports/expressions driving the parameter). This runs on
                 // TouchDesigner's cook thread inside an extern "C" call, so
-                // fall back to the first variant instead of panicking.
-                *self = #enum_ident::try_from(idx).unwrap_or(#enum_ident::#first_variant);
+                // fall back to the default variant instead of panicking.
+                *self = #enum_ident::try_from(idx).unwrap_or(#enum_ident::#fallback_variant);
             }
         }
     };
