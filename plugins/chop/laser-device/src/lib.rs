@@ -332,6 +332,15 @@ impl LaserDeviceChop {
                         self.teardown(backend);
                     }
                     self.conn = Connection::Idle;
+                    // A drain that finishes while the node is inactive is
+                    // the deactivation edge for that connect: clear any
+                    // warning left from before it was parked (the
+                    // deactivate-while-Draining arm above re-parks without
+                    // clearing).
+                    if !want {
+                        self.set_info("");
+                        self.set_warning("");
+                    }
                 }
             }
         }
@@ -481,13 +490,17 @@ impl Drop for LaserDeviceChop {
         // Node deletion / project close while Active: retire the live
         // backend through the same flush-then-stop path as deactivation
         // (DacBackend's own Drop would stop before the disarm takes
-        // effect). Detached on purpose — joining here would block TD's main
-        // thread; on process exit the flush may truncate, which is the best
-        // a plugin can do.
+        // effect). SYNCHRONOUS on purpose, unlike every other teardown:
+        // TouchDesigner may unload the plugin binary once its last node is
+        // gone, and a detached thread still running plugin code would then
+        // execute unmapped memory. Blocking here (~300ms flush + scheduler
+        // join) also guarantees the DAC is released before a recreated node
+        // (cut/paste, undo) attempts its first connect. Node deletion is a
+        // rare, deliberate act — a brief hitch is the safe trade.
         if let Connection::Connected { backend, .. } =
             std::mem::replace(&mut self.conn, Connection::Idle)
         {
-            std::thread::spawn(move || backend.shutdown());
+            backend.shutdown();
         }
     }
 }
