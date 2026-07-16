@@ -34,6 +34,19 @@ impl ChopInput {
             )
         }
     }
+
+    /// Get the name of a channel.
+    pub fn channel_name(&self, index: usize) -> &str {
+        if index >= self.num_channels() {
+            panic!("index out of bounds");
+        }
+
+        unsafe {
+            std::ffi::CStr::from_ptr(*self.input.nameData.add(index))
+                .to_str()
+                .unwrap_or("")
+        }
+    }
 }
 
 impl<'cook> GetInput<'cook, ChopInput> for OperatorInputs<'cook, ChopInput> {

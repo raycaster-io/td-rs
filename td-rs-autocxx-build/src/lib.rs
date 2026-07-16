@@ -31,6 +31,14 @@ pub fn build(output: &str, include_base: bool) -> miette::Result<()> {
     if cfg!(windows) {
         clang_args.push("-std=c++17");
         clang_args.push("-D_CRT_USE_BUILTIN_OFFSETOF");
+    } else {
+        // CPlusPlus_Common.h only includes <stdint.h> on _WIN32; libc++ (macOS)
+        // provides the fixed-width types and offsetof transitively but
+        // libstdc++ (Linux) does not.
+        clang_args.push("-include");
+        clang_args.push("cstdint");
+        clang_args.push("-include");
+        clang_args.push("cstddef");
     }
 
     let b = autocxx_build::Builder::new("src/cxx.rs", &incs)
@@ -48,7 +56,18 @@ pub fn build(output: &str, include_base: bool) -> miette::Result<()> {
         b.flag("-Wno-unused-parameter")
             .flag("-Wno-reorder-ctor")
             .flag("-Wno-mismatched-tags")
-            .flag("-Wno-unused-private-field");
+            .flag("-Wno-unused-private-field")
+            .flag("-include")
+            .flag("cstdint")
+            .flag("-include")
+            .flag("cstddef");
+    }
+
+    if cfg!(target_os = "linux") {
+        // The TD headers use MSVC-isms (__cdecl) and patterns g++ rejects;
+        // they are only ever compiled with clang (macOS/MSVC-clang), so use
+        // clang++ rather than the g++ that cc-rs picks by default on Linux.
+        b.compiler("clang++");
     }
 
     b.compile(output);
