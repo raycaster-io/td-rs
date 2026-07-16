@@ -115,6 +115,13 @@ def build():
                 new_pars[i] if i < len(new_pars) else None,
             )
             if target is not None:
+                # Seed the COMP par with the plugin's default before binding
+                # (bound pars adopt the bind master's value — without this a
+                # fresh .tox would start with Pps=0, Intensity=0, ...).
+                try:
+                    target.val = member.eval()
+                except Exception as e:  # noqa: BLE001
+                    print(f'could not seed {target.name}: {e}')
                 member.bindExpr = f"parent().par.{target.name}"
 
     # Forward the promoted Refresh pulse as a real pulse event.
