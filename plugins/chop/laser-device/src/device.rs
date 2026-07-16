@@ -16,13 +16,33 @@ const BLANK_POINTS: usize = 32;
 /// MTU so frames survive networks that drop fragmented UDP.
 const PONK_MAX_DATAGRAM: usize = 1400;
 
+/// How a send failed — this drives the plugin's state machine, so the split
+/// matters: only errors that need a reconnect may take the node to `Failed`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SendError {
+    /// Transient or input-caused problem (bad frame data, device mid-
+    /// reconnect, socket backpressure). Surface a warning but stay connected:
+    /// the next frame may well succeed.
+    Warn(String),
+    /// The backend is dead and needs a reconnect.
+    Fatal(String),
+}
+
+impl SendError {
+    pub fn message(&self) -> &str {
+        match self {
+            SendError::Warn(m) | SendError::Fatal(m) => m,
+        }
+    }
+}
+
 /// A destination laser points can be streamed to once per cook.
 pub trait LaserBackend: Send {
     /// Submit one frame of points. Must not block the cook thread.
-    fn send(&mut self, points: &[Point2]) -> Result<(), String>;
-    /// Emit an all-black frame (safety blank), used before teardown and when
-    /// the input goes away.
-    fn blank(&mut self) -> Result<(), String>;
+    fn send(&mut self, points: &[Point2]) -> Result<(), SendError>;
+    /// Emit an all-black frame (safety blank), used when the input goes away.
+    /// (Teardown safety is the backend's own job on Drop — see `DacBackend`.)
+    fn blank(&mut self) -> Result<(), SendError>;
     /// Human-readable description of the connected output for the info popup.
     fn describe(&self) -> String;
     /// Whether the underlying output still looks healthy.
@@ -41,15 +61,10 @@ pub struct DeviceEntry {
 }
 
 fn menu_token(id: &str) -> String {
-    let mut token = String::with_capacity(id.len());
-    for ch in id.chars() {
-        if ch.is_ascii_alphanumeric() {
-            token.push(ch.to_ascii_lowercase());
-        } else if !token.ends_with('_') {
-            token.push('_');
-        }
-    }
-    token.trim_matches('_').to_string()
+    // laser-dac already ships the slug algorithm (it builds its stable ids
+    // with it); reuse it rather than maintaining a divergent copy. TD menu
+    // tokens use '_' where the slug uses '-'.
+    laser_dac::slugify_device_id(id).replace('-', "_")
 }
 
 /// Scan for DACs. Blocking (network/USB discovery) — call only from user
@@ -106,19 +121,31 @@ impl DacBackend {
 }
 
 impl LaserBackend for DacBackend {
-    fn send(&mut self, points: &[Point2]) -> Result<(), String> {
+    fn send(&mut self, points: &[Point2]) -> Result<(), SendError> {
         if self.session.is_finished() {
-            return Err(format!("session on '{}' has stopped", self.id));
+            return Err(SendError::Fatal(format!(
+                "session on '{}' has stopped",
+                self.id
+            )));
         }
         let points: Vec<LaserPoint> = points
             .iter()
             .map(|p| LaserPoint::new(p.x, p.y, p.r, p.g, p.b, p.i))
             .collect();
         self.session.send_frame(Frame::new(points));
+        // send_frame is a latest-wins slot write and never fails, but during
+        // an auto-reconnect nothing is consuming the slot — report that,
+        // or an outage would look like healthy streaming.
+        if !self.session.metrics().connected() {
+            return Err(SendError::Warn(format!(
+                "'{}' disconnected — reconnecting",
+                self.name
+            )));
+        }
         Ok(())
     }
 
-    fn blank(&mut self) -> Result<(), String> {
+    fn blank(&mut self) -> Result<(), SendError> {
         self.send(&[Point2::default(); BLANK_POINTS])
     }
 
@@ -133,6 +160,12 @@ impl LaserBackend for DacBackend {
 
 impl Drop for DacBackend {
     fn drop(&mut self) {
+        // Disarm BEFORE stopping: stop() is checked by the scheduler ahead of
+        // the frame slot, so a blank frame sent just before teardown is
+        // usually discarded, and the stop path's shutter close is a no-op on
+        // Ether Dream/IDN. Disarming forces intensity/RGB to zero in software
+        // regardless — laser-dac's documented safe-off for exactly this.
+        let _ = self.session.control().disarm();
         let _ = self.session.control().stop();
     }
 }
@@ -181,16 +214,25 @@ impl PonkBackend {
         })
     }
 
-    fn send_frame(&mut self, frame: &PonkFrame) -> Result<(), String> {
+    fn send_frame(&mut self, frame: &PonkFrame) -> Result<(), SendError> {
+        // PONK is connectionless UDP: nothing about a failed frame needs a
+        // reconnect, so every error here is Warn — encoding errors are
+        // input-data problems (e.g. more points than fit in 255 chunks) and
+        // the very next frame may encode fine.
         let datagrams = encode_datagrams(frame, DataFormat::XyF32RgbU8, PONK_MAX_DATAGRAM)
-            .map_err(|e| format!("PONK encoding failed: {e:?}"))?;
+            .map_err(|e| SendError::Warn(format!("PONK encoding failed: {e:?}")))?;
         for datagram in datagrams {
             match self.socket.send_to(&datagram, self.dest) {
                 Ok(_) => {}
                 // A non-blocking socket with a full send buffer drops the
                 // frame; the next cook sends a fresh one.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) => return Err(format!("PONK send to {} failed: {e}", self.dest)),
+                Err(e) => {
+                    return Err(SendError::Warn(format!(
+                        "PONK send to {} failed: {e}",
+                        self.dest
+                    )))
+                }
             }
         }
         Ok(())
@@ -230,13 +272,13 @@ pub fn ponk_frame(
 }
 
 impl LaserBackend for PonkBackend {
-    fn send(&mut self, points: &[Point2]) -> Result<(), String> {
+    fn send(&mut self, points: &[Point2]) -> Result<(), SendError> {
         self.frame_number = self.frame_number.wrapping_add(1);
         let frame = ponk_frame(self.sender_id, &self.sender_name, self.frame_number, points);
         self.send_frame(&frame)
     }
 
-    fn blank(&mut self) -> Result<(), String> {
+    fn blank(&mut self) -> Result<(), SendError> {
         // A pathless frame tells receivers to draw nothing.
         self.send(&[])
     }

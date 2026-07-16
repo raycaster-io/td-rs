@@ -44,8 +44,10 @@ impl ChannelMap {
 /// Name matching is case-insensitive: `x`/`tx`, `y`/`ty`, `r`/`red`,
 /// `g`/`green`, `b`/`blue`, `i`/`intensity`. This matches the channel layout
 /// TouchDesigner's native laser workflow uses (x/y/r/g/b, one sample per
-/// point). When no x and y channels are found by name, channels are assigned
-/// positionally: 0=x, 1=y, 2=r, 3=g, 4=b, 5=i.
+/// point). When neither x nor y is named, channels are assigned positionally:
+/// 0=x, 1=y, 2=r, 3=g, 4=b, 5=i. Naming exactly one of x/y is an error —
+/// silently mapping a channel named `y` onto the X axis positionally would
+/// draw a transposed figure with no warning.
 pub fn resolve_channels(names: &[&str]) -> Result<ChannelMap, String> {
     if names.len() < 2 {
         return Err(format!(
@@ -62,25 +64,32 @@ pub fn resolve_channels(names: &[&str]) -> Result<ChannelMap, String> {
 
     let x = find(&["x", "tx"]);
     let y = find(&["y", "ty"]);
-    if let (Some(x), Some(y)) = (x, y) {
-        Ok(ChannelMap {
+    match (x, y) {
+        (Some(x), Some(y)) => Ok(ChannelMap {
             x,
             y,
             r: find(&["r", "red"]),
             g: find(&["g", "green"]),
             b: find(&["b", "blue"]),
             i: find(&["i", "intensity"]),
-        })
-    } else {
-        let nth = |n: usize| -> Option<usize> { (names.len() > n).then_some(n) };
-        Ok(ChannelMap {
-            x: 0,
-            y: 1,
-            r: nth(2),
-            g: nth(3),
-            b: nth(4),
-            i: nth(5),
-        })
+        }),
+        (None, None) => {
+            let nth = |n: usize| -> Option<usize> { (names.len() > n).then_some(n) };
+            Ok(ChannelMap {
+                x: 0,
+                y: 1,
+                r: nth(2),
+                g: nth(3),
+                b: nth(4),
+                i: nth(5),
+            })
+        }
+        (Some(_), None) => Err("input names an x channel but no y — name both \
+             (x/y) or neither (positional order)"
+            .to_string()),
+        (None, Some(_)) => Err("input names a y channel but no x — name both \
+             (x/y) or neither (positional order)"
+            .to_string()),
     }
 }
 
@@ -108,7 +117,9 @@ fn color_to_u16(v: f32) -> u16 {
 ///
 /// Rules:
 /// - x/y are scaled then hard-clamped to [-1, 1] (never let a bad input
-///   drive a scanner out of range).
+///   drive a scanner out of range). `f32::clamp` passes NaN through, so
+///   non-finite coordinates are handled first: the point is emitted fully
+///   blanked (beam off) at center rather than sending NaN to a scanner.
 /// - Colors are clamped to [0, 1] then scaled to 16 bit. If the input has no
 ///   color channels every point gets `default_rgb`; if it has some, missing
 ///   channels are 0.
@@ -134,6 +145,15 @@ pub fn build_points(
     };
 
     for s in 0..num_samples {
+        let x = channels[map.x][s] * opts.scale;
+        let y = channels[map.y][s] * opts.scale;
+        if !x.is_finite() || !y.is_finite() {
+            // NaN survives f32::clamp, and PONK's encoder rejects non-finite
+            // coordinates outright. Emit a blanked (beam-off) point instead.
+            out.push(Point2::default());
+            continue;
+        }
+
         let (r, g, b) = if has_color {
             (color(map.r, s), color(map.g, s), color(map.b, s))
         } else {
@@ -148,8 +168,8 @@ pub fn build_points(
             None => master,
         };
         out.push(Point2 {
-            x: (channels[map.x][s] * opts.scale).clamp(-1.0, 1.0),
-            y: (channels[map.y][s] * opts.scale).clamp(-1.0, 1.0),
+            x: x.clamp(-1.0, 1.0),
+            y: y.clamp(-1.0, 1.0),
             r,
             g,
             b,
@@ -202,6 +222,46 @@ mod tests {
     fn rejects_fewer_than_two_channels() {
         assert!(resolve_channels(&["x"]).is_err());
         assert!(resolve_channels(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_partial_xy_naming() {
+        // A channel explicitly named y must never drive the X axis via the
+        // positional fallback.
+        assert!(resolve_channels(&["y", "brightness"]).is_err());
+        assert!(resolve_channels(&["x", "brightness"]).is_err());
+        assert!(resolve_channels(&["a", "b", "x", "d"]).is_err());
+    }
+
+    #[test]
+    fn non_finite_coordinates_emit_blanked_points() {
+        let map = resolve_channels(&["x", "y"]).unwrap();
+        let mut out = Vec::new();
+        build_points(
+            &[&[f32::NAN, 0.5, f32::INFINITY], &[0.0, 0.5, 0.0]],
+            3,
+            &map,
+            &OPTS,
+            &mut out,
+        );
+        assert_eq!(out[0], Point2::default()); // NaN x → blanked
+        assert_eq!(out[1].x, 0.5); // finite point untouched
+        assert_eq!(out[1].i, 65535);
+        assert_eq!(out[2], Point2::default()); // inf x → blanked
+        assert!(out.iter().all(|p| p.x.is_finite() && p.y.is_finite()));
+    }
+
+    #[test]
+    fn non_finite_via_scale_emits_blanked_points() {
+        let map = resolve_channels(&["x", "y"]).unwrap();
+        let mut out = Vec::new();
+        // 0.0 * inf = NaN happens inside the scale multiply too.
+        let opts = MapOptions {
+            scale: f32::INFINITY,
+            ..OPTS
+        };
+        build_points(&[&[0.0], &[1.0]], 1, &map, &opts, &mut out);
+        assert_eq!(out[0], Point2::default());
     }
 
     #[test]

@@ -7,14 +7,21 @@
 //! case-insensitively with a positional fallback (see `mapping`).
 //!
 //! Laser safety: the Active toggle defaults to off, x/y are hard-clamped to
-//! [-1, 1] and a blank frame is emitted on teardown or input loss. Galvo
+//! [-1, 1] (non-finite coordinates are blanked), a blank frame is emitted on
+//! input loss, and hardware sessions are disarmed on teardown. Galvo
 //! velocity/density limiting is the DAC's (or laser-dac's) responsibility —
 //! this plugin does not implement scanner-safety profiles.
+//!
+//! Threading: DAC discovery and connecting both block for seconds (network
+//! scans), so they run on background threads and hand results back over
+//! channels; `execute()` only ever polls.
 
 mod device;
 mod mapping;
 
-use device::{DacBackend, DeviceEntry, LaserBackend, PonkBackend};
+use std::sync::mpsc;
+
+use device::{DacBackend, DeviceEntry, LaserBackend, PonkBackend, SendError};
 use mapping::{MapOptions, Point2};
 use td_rs_chop::sop::Color;
 use td_rs_chop::*;
@@ -58,134 +65,284 @@ struct LaserDeviceParams {
     sender_name: String,
 }
 
-enum Connection {
-    Idle,
-    Connected {
-        backend: Box<dyn LaserBackend>,
-        /// Snapshot of the connection-relevant params, for change detection.
-        config_key: String,
-        frames_sent: u64,
-        last_points: usize,
+/// Snapshot of the parameters the ACTIVE backend actually connects with.
+/// Scoping fields per backend means editing PONK params never tears down a
+/// live hardware session (and vice versa), and comparing structs instead of
+/// a joined string cannot alias across field boundaries.
+#[derive(Clone, PartialEq, Debug)]
+enum ConnConfig {
+    Hardware {
+        device: String,
+        pps: u32,
     },
-    /// A failed connection is retried only when the config changes or the
-    /// user pulses Refresh — never every cook, which would hitch every frame.
-    Failed {
-        config_key: String,
+    Ponk {
+        address: String,
+        sender_name: String,
     },
 }
 
-/// What went wrong during a cook's send step.
-enum CookIssue {
-    /// Input data problem — warn but stay connected.
-    Input(String),
-    /// Device problem — drop to Failed so Refresh/param changes retry.
-    Device(String),
+type ConnectResult = Result<Box<dyn LaserBackend>, String>;
+
+enum Connection {
+    Idle,
+    /// A background thread is opening the backend.
+    Connecting {
+        rx: mpsc::Receiver<ConnectResult>,
+        config: ConnConfig,
+    },
+    Connected {
+        backend: Box<dyn LaserBackend>,
+        config: ConnConfig,
+        frames_sent: u64,
+        last_points: usize,
+    },
+    /// A failed connection is retried when the config changes, the user
+    /// pulses Refresh, or a device scan completes — never every cook, which
+    /// would spawn a connect attempt per frame.
+    Failed {
+        config: ConnConfig,
+    },
 }
 
 pub struct LaserDeviceChop {
     params: LaserDeviceParams,
     conn: Connection,
     devices: Vec<DeviceEntry>,
+    /// In-flight background device scan, if any.
+    scan_rx: Option<mpsc::Receiver<Result<Vec<DeviceEntry>, String>>>,
     scanned_once: bool,
     force_reconnect: bool,
     points_buf: Vec<Point2>,
+    // Per-instance status strings: the framework's default set_info/
+    // set_warning/set_error route through process-wide statics shared by
+    // every node of this plugin type, so two Laser Device nodes would
+    // overwrite each other's messages.
+    info_msg: String,
+    warning_msg: String,
+    error_msg: String,
 }
 
 impl LaserDeviceChop {
-    fn config_key(&self) -> String {
-        format!(
-            "{:?}|{}|{}|{}|{}",
-            self.params.backend,
-            self.params.device.0.as_deref().unwrap_or(""),
-            self.params.pps,
-            self.params.address,
-            self.params.sender_name,
-        )
-    }
-
-    fn refresh_devices(&mut self) {
-        self.scanned_once = true;
-        match device::discover() {
-            Ok(devices) => self.devices = devices,
-            Err(e) => self.set_warning(&e),
-        }
-    }
-
-    fn connect_backend(&self) -> Result<Box<dyn LaserBackend>, String> {
+    fn conn_config(&self) -> ConnConfig {
         match self.params.backend {
-            OutputBackend::Hardware => {
-                let token = self
-                    .params
-                    .device
-                    .0
-                    .as_deref()
-                    .filter(|t| !t.is_empty())
-                    .ok_or("no device selected — press Refresh Devices and pick one")?;
-                let entry = self
-                    .devices
-                    .iter()
-                    .find(|e| e.token == token)
-                    .ok_or_else(|| format!("device '{token}' not found — press Refresh Devices"))?;
-                Ok(Box::new(DacBackend::connect(&entry.id, self.params.pps)?))
-            }
-            OutputBackend::PonkNetwork => Ok(Box::new(PonkBackend::connect(
-                &self.params.address,
-                &self.params.sender_name,
-            )?)),
+            OutputBackend::Hardware => ConnConfig::Hardware {
+                device: self.params.device.0.clone().unwrap_or_default(),
+                pps: self.params.pps,
+            },
+            OutputBackend::PonkNetwork => ConnConfig::Ponk {
+                address: self.params.address.clone(),
+                sender_name: self.params.sender_name.clone(),
+            },
         }
+    }
+
+    /// Kick off a background device scan unless one is already running.
+    /// Discovery blocks for ~2s of sequential network scans, so it must
+    /// never run on the cook thread.
+    fn refresh_devices(&mut self) {
+        if self.scan_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(device::discover());
+        });
+        self.scan_rx = Some(rx);
+    }
+
+    /// Collect a finished background scan, if any.
+    fn poll_devices(&mut self) {
+        let Some(rx) = self.scan_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(devices)) => {
+                self.devices = devices;
+                // A fresh scan may make a previously-unresolvable device
+                // selection connectable (e.g. a saved .toe whose device is
+                // found by the startup scan) — retry a Failed connection.
+                if self.params.active && matches!(self.conn, Connection::Failed { .. }) {
+                    self.force_reconnect = true;
+                }
+            }
+            Ok(Err(e)) => self.set_warning(&e),
+            Err(mpsc::TryRecvError::Empty) => self.scan_rx = Some(rx),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.set_warning("device scan thread terminated unexpectedly");
+            }
+        }
+    }
+
+    /// Start opening a backend on a background thread. Validation problems
+    /// (nothing selected, unknown device) fail immediately without a thread.
+    fn spawn_connect(&mut self, config: ConnConfig) {
+        type Work = Box<dyn FnOnce() -> ConnectResult + Send>;
+        let work: Work = match &config {
+            ConnConfig::Hardware { device, pps } => {
+                if device.is_empty() {
+                    self.set_warning("no device selected — press Refresh Devices and pick one");
+                    self.conn = Connection::Failed { config };
+                    return;
+                }
+                let Some(entry) = self.devices.iter().find(|e| e.token == *device) else {
+                    self.set_warning(&format!(
+                        "device '{device}' not found — press Refresh Devices"
+                    ));
+                    self.conn = Connection::Failed { config };
+                    return;
+                };
+                let id = entry.id.clone();
+                let pps = *pps;
+                Box::new(move || {
+                    DacBackend::connect(&id, pps).map(|b| Box::new(b) as Box<dyn LaserBackend>)
+                })
+            }
+            ConnConfig::Ponk {
+                address,
+                sender_name,
+            } => {
+                let address = address.clone();
+                let sender_name = sender_name.clone();
+                Box::new(move || {
+                    PonkBackend::connect(&address, &sender_name)
+                        .map(|b| Box::new(b) as Box<dyn LaserBackend>)
+                })
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        self.set_info("connecting…");
+        self.conn = Connection::Connecting { rx, config };
     }
 
     /// Drive the connection state machine from the current params. All
-    /// connects/teardowns happen here, once per cook at most.
+    /// transitions happen here, once per cook at most.
     fn reconcile(&mut self) {
-        let key = self.config_key();
         let want = self.params.active;
+        let config = self.conn_config();
 
-        let teardown = matches!(
-            &self.conn,
-            Connection::Connected { config_key, .. } if !want || *config_key != key
-        );
-        if teardown {
+        // Consume the Refresh latch up front: a pulse while Connected must
+        // not linger and trigger a surprise reconnect after a later failure.
+        let force = std::mem::take(&mut self.force_reconnect);
+
+        // Tear down when deactivated or when the active backend's config
+        // changed. (An abandoned Connecting thread drops its backend when
+        // the channel closes; DacBackend's Drop disarms the session.)
+        let stale = match &self.conn {
+            Connection::Connected { config: c, .. } | Connection::Connecting { config: c, .. } => {
+                !want || *c != config
+            }
+            _ => false,
+        };
+        if stale {
             if let Connection::Connected { mut backend, .. } =
                 std::mem::replace(&mut self.conn, Connection::Idle)
             {
                 let _ = backend.blank();
-                // Dropping the backend stops its session.
+                // Dropping the backend disarms and stops its session.
             }
             self.set_info("");
         }
 
         if !want {
+            // A deactivated node must not keep displaying stale status.
             self.conn = Connection::Idle;
+            self.set_warning("");
+            return;
+        }
+
+        // Poll an in-flight connect.
+        let outcome = match &self.conn {
+            Connection::Connecting { rx, .. } => match rx.try_recv() {
+                Ok(res) => Some(res),
+                Err(mpsc::TryRecvError::Empty) => return, // still connecting
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("connect thread terminated unexpectedly".to_string()))
+                }
+            },
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            if let Connection::Connecting { config, .. } =
+                std::mem::replace(&mut self.conn, Connection::Idle)
+            {
+                match outcome {
+                    Ok(backend) => {
+                        self.set_info(&backend.describe());
+                        self.set_warning("");
+                        self.conn = Connection::Connected {
+                            backend,
+                            config,
+                            frames_sent: 0,
+                            last_points: 0,
+                        };
+                    }
+                    Err(e) => {
+                        self.set_warning(&e);
+                        self.set_info("");
+                        self.conn = Connection::Failed { config };
+                    }
+                }
+            }
             return;
         }
 
         let should_connect = match &self.conn {
             Connection::Idle => true,
-            Connection::Failed { config_key } => self.force_reconnect || *config_key != key,
-            Connection::Connected { .. } => false,
+            Connection::Failed { config: c } => force || *c != config,
+            Connection::Connected { .. } | Connection::Connecting { .. } => false,
         };
-        if !should_connect {
-            return;
+        if should_connect {
+            self.spawn_connect(config);
         }
-        self.force_reconnect = false;
+    }
 
-        match self.connect_backend() {
-            Ok(backend) => {
-                self.set_info(&backend.describe());
-                self.set_warning("");
-                self.conn = Connection::Connected {
-                    backend,
-                    config_key: key,
-                    frames_sent: 0,
-                    last_points: 0,
-                };
+    /// One cook's data path: map the input channels into points and hand one
+    /// frame to the backend. Returns the number of points sent.
+    fn stream_frame(
+        backend: &mut dyn LaserBackend,
+        inputs: &OperatorInputs<ChopInput>,
+        params: &LaserDeviceParams,
+        points_buf: &mut Vec<Point2>,
+    ) -> Result<usize, SendError> {
+        let input = match inputs.input(0) {
+            Some(input) if input.num_channels() >= 2 => input,
+            _ => {
+                let _ = backend.blank();
+                return Err(SendError::Warn(
+                    "input CHOP with at least x and y channels is required".to_string(),
+                ));
             }
+        };
+
+        let names: Vec<&str> = (0..input.num_channels())
+            .map(|i| input.channel_name(i))
+            .collect();
+        let map = match mapping::resolve_channels(&names) {
+            Ok(map) => map,
             Err(e) => {
-                self.set_warning(&e);
-                self.conn = Connection::Failed { config_key: key };
+                let _ = backend.blank();
+                return Err(SendError::Warn(e));
             }
-        }
+        };
+
+        let channels: Vec<&[f32]> = (0..input.num_channels())
+            .map(|i| input.channel(i))
+            .collect();
+        let opts = MapOptions {
+            scale: params.scale,
+            intensity: params.intensity,
+            default_rgb: [
+                params.default_color.r,
+                params.default_color.g,
+                params.default_color.b,
+            ],
+        };
+        mapping::build_points(&channels, input.num_samples(), &map, &opts, points_buf);
+        backend.send(points_buf).map(|_| points_buf.len())
     }
 }
 
@@ -202,21 +359,22 @@ impl OpNew for LaserDeviceChop {
                 intensity: 1.0,
                 scale: 1.0,
                 default_color: (1.0, 1.0, 1.0, 1.0).into(),
-                address: format!(
-                    "{}.{}.{}.{}:{}",
-                    ponk_protocol::MULTICAST_ADDR[0],
-                    ponk_protocol::MULTICAST_ADDR[1],
-                    ponk_protocol::MULTICAST_ADDR[2],
-                    ponk_protocol::MULTICAST_ADDR[3],
-                    ponk_protocol::DEFAULT_PORT
-                ),
+                address: std::net::SocketAddrV4::new(
+                    ponk_protocol::MULTICAST_ADDR.into(),
+                    ponk_protocol::DEFAULT_PORT,
+                )
+                .to_string(),
                 sender_name: "TouchDesigner".to_string(),
             },
             conn: Connection::Idle,
             devices: Vec::new(),
+            scan_rx: None,
             scanned_once: false,
             force_reconnect: false,
             points_buf: Vec::new(),
+            info_msg: String::new(),
+            warning_msg: String::new(),
+            error_msg: String::new(),
         }
     }
 }
@@ -226,8 +384,8 @@ impl OpInfo for LaserDeviceChop {
     const OPERATOR_LABEL: &'static str = "Laser Device";
     const MIN_INPUTS: usize = 1;
     const MAX_INPUTS: usize = 1;
-    // Populate the device menu's discovery cache before the user first opens
-    // it (build_dynamic_menu takes &self, so it cannot scan itself).
+    // Kick off the device scan before the user first opens the Device menu
+    // (build_dynamic_menu takes &self, so it cannot scan itself).
     const COOK_ON_START: bool = true;
 }
 
@@ -242,6 +400,31 @@ impl Op for LaserDeviceChop {
             self.force_reconnect = true;
         }
     }
+
+    // Per-instance status storage — see the field comments on the struct.
+    fn set_info(&mut self, info: &str) {
+        self.info_msg.replace_range(.., info);
+    }
+
+    fn info(&self) -> String {
+        self.info_msg.clone()
+    }
+
+    fn set_warning(&mut self, warning: &str) {
+        self.warning_msg.replace_range(.., warning);
+    }
+
+    fn warning(&self) -> String {
+        self.warning_msg.clone()
+    }
+
+    fn set_error(&mut self, error: &str) {
+        self.error_msg.replace_range(.., error);
+    }
+
+    fn error(&self) -> String {
+        self.error_msg.clone()
+    }
 }
 
 impl Chop for LaserDeviceChop {
@@ -255,82 +438,51 @@ impl Chop for LaserDeviceChop {
         params.enable_param("Sendername", !hardware);
 
         if !self.scanned_once {
+            self.scanned_once = true;
             self.refresh_devices();
         }
+        self.poll_devices();
         self.reconcile();
 
-        // Stream one frame. Warnings are applied after the &mut borrow of
+        // Stream one frame. The outcome is applied after the &mut borrow of
         // self.conn ends (set_warning needs &mut self).
-        let mut issue: Option<CookIssue> = None;
-        let mut sent_points: Option<usize> = None;
-        if let Connection::Connected { backend, .. } = &mut self.conn {
-            match inputs.input(0) {
-                Some(input) if input.num_channels() >= 2 => {
-                    let names: Vec<&str> = (0..input.num_channels())
-                        .map(|i| input.channel_name(i))
-                        .collect();
-                    match mapping::resolve_channels(&names) {
-                        Ok(map) => {
-                            let channels: Vec<&[f32]> = (0..input.num_channels())
-                                .map(|i| input.channel(i))
-                                .collect();
-                            let opts = MapOptions {
-                                scale: self.params.scale,
-                                intensity: self.params.intensity,
-                                default_rgb: [
-                                    self.params.default_color.r,
-                                    self.params.default_color.g,
-                                    self.params.default_color.b,
-                                ],
-                            };
-                            mapping::build_points(
-                                &channels,
-                                input.num_samples(),
-                                &map,
-                                &opts,
-                                &mut self.points_buf,
-                            );
-                            match backend.send(&self.points_buf) {
-                                Ok(()) => sent_points = Some(self.points_buf.len()),
-                                Err(e) => issue = Some(CookIssue::Device(e)),
-                            }
-                        }
-                        Err(e) => {
-                            let _ = backend.blank();
-                            issue = Some(CookIssue::Input(e));
-                        }
-                    }
+        let outcome = match &mut self.conn {
+            Connection::Connected { backend, .. } => Some(Self::stream_frame(
+                backend.as_mut(),
+                inputs,
+                &self.params,
+                &mut self.points_buf,
+            )),
+            _ => None,
+        };
+        match outcome {
+            None => {}
+            Some(Ok(n)) => {
+                if let Connection::Connected {
+                    frames_sent,
+                    last_points,
+                    ..
+                } = &mut self.conn
+                {
+                    *frames_sent += 1;
+                    *last_points = n;
                 }
-                _ => {
-                    let _ = backend.blank();
-                    issue = Some(CookIssue::Input(
-                        "input CHOP with at least x and y channels is required".to_string(),
-                    ));
-                }
+                self.set_warning("");
             }
-        }
-
-        match issue {
-            None => {
-                if let Some(n) = sent_points {
-                    if let Connection::Connected {
-                        frames_sent,
-                        last_points,
-                        ..
-                    } = &mut self.conn
-                    {
-                        *frames_sent += 1;
-                        *last_points = n;
-                    }
-                    self.set_warning("");
-                }
-            }
-            Some(CookIssue::Input(e)) => self.set_warning(&e),
-            Some(CookIssue::Device(e)) => {
+            // Transient/input-caused: warn but stay connected — the next
+            // frame may succeed (e.g. the DAC is auto-reconnecting, or one
+            // frame had bad data).
+            Some(Err(SendError::Warn(e))) => self.set_warning(&e),
+            // The backend is dead: drop to Failed so a config change,
+            // Refresh, or completed scan retries.
+            Some(Err(SendError::Fatal(e))) => {
                 self.set_warning(&e);
-                let key = self.config_key();
-                self.conn = Connection::Failed { config_key: key };
                 self.set_info("");
+                if let Connection::Connected { config, .. } =
+                    std::mem::replace(&mut self.conn, Connection::Idle)
+                {
+                    self.conn = Connection::Failed { config };
+                }
             }
         }
 

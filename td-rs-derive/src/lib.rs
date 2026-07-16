@@ -32,6 +32,10 @@ pub fn derive_param(input: TokenStream) -> TokenStream {
 
     let variants = enum_data.variants.into_iter().collect::<Vec<Variant>>();
     let try_from_i32_match_arms = try_from_i32_match_arms(&variants);
+    let first_variant = &variants
+        .first()
+        .expect("`Param` enums must have at least one variant")
+        .ident;
 
     let output = quote! {
         impl MenuParam for #enum_ident {
@@ -69,8 +73,11 @@ pub fn derive_param(input: TokenStream) -> TokenStream {
 
             fn update(&mut self, name: &str, inputs: &ParamInputs) {
                 let idx = inputs.get_int(name, 0);
-                let value = #enum_ident::try_from(idx).unwrap();
-                *self = value;
+                // Menu indices can arrive out of range (stale saved files,
+                // exports/expressions driving the parameter). This runs on
+                // TouchDesigner's cook thread inside an extern "C" call, so
+                // fall back to the first variant instead of panicking.
+                *self = #enum_ident::try_from(idx).unwrap_or(#enum_ident::#first_variant);
             }
         }
     };
