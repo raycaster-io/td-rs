@@ -1,0 +1,23 @@
+[package]
+name = "laser-device"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.td-rs]
+type = "chop"
+
+[lib]
+name = "laser_device"
+crate-type = ["staticlib"]
+
+[dependencies]
+td-rs-chop = { path = "../../../td-rs-chop" }
+td-rs-derive = { path = "../../../td-rs-derive" }
+laser-dac = { version = "0.13", default-features = false, features = ["network-dacs"] }
+ponk-protocol = "0.1"
+
+# The oscilloscope/audio test backend needs a system audio API (ALSA headers on
+# Linux, which is not a TouchDesigner platform), so only enable it on the
+# platforms TouchDesigner actually runs on.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+laser-dac = { version = "0.13", default-features = false, features = ["network-dacs", "audio-dacs"] }
